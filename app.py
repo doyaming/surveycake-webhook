@@ -99,12 +99,32 @@ def fetch_surveycake_data(svid, hash_value):
     return None
 
 
-def decrypt_surveycake_data(encrypted_data):
+def get_survey_keys(svid):
+    """從 Supabase 查詢問卷的密鑰配置"""
+    try:
+        logger.info(f"正在查詢問卷 {svid} 的密鑰配置...")
+        result = supabase.table('survey_keys').select('hash_key, iv_key, survey_name').eq('survey_id', svid).eq('is_active', True).execute()
+
+        if result.data and len(result.data) > 0:
+            keys = result.data[0]
+            logger.info(f"✓ 找到問卷密鑰配置: {keys.get('survey_name', svid)}")
+            return keys['hash_key'], keys['iv_key']
+        else:
+            logger.error(f"❌ 找不到問卷 {svid} 的密鑰配置")
+            return None, None
+    except Exception as e:
+        logger.error(f"❌ 查詢密鑰配置錯誤: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None
+
+
+def decrypt_surveycake_data(encrypted_data, hash_key, iv_key):
     """解密 SurveyCake webhook 資料"""
     try:
         encrypted_bytes = base64.b64decode(encrypted_data)
-        key = SURVEYCAKE_HASH_KEY.encode('utf-8')
-        iv = SURVEYCAKE_IV_KEY.encode('utf-8')
+        key = hash_key.encode('utf-8')
+        iv = iv_key.encode('utf-8')
         cipher = AES.new(key, AES.MODE_CBC, iv)
         decrypted_padded = cipher.decrypt(encrypted_bytes)
         decrypted_data = decrypted_padded.rstrip(b'\0')
@@ -246,7 +266,15 @@ def surveycake_webhook():
         logger.info(f"問卷 ID (svid): {svid}")
         logger.info(f"回應 Hash: {hash_value}")
 
-        # 步驟 1: 從 SurveyCake API 取得加密資料
+        # 步驟 1: 查詢問卷的密鑰配置
+        hash_key, iv_key = get_survey_keys(svid)
+        if hash_key is None or iv_key is None:
+            return jsonify({
+                'status': 'error',
+                'message': f'找不到問卷 {svid} 的密鑰配置，請先在 Supabase 的 survey_keys 表格中新增此問卷的密鑰'
+            }), 404
+
+        # 步驟 2: 從 SurveyCake API 取得加密資料
         encrypted_data = fetch_surveycake_data(svid, hash_value)
         if encrypted_data is None:
             return jsonify({
@@ -254,9 +282,9 @@ def surveycake_webhook():
                 'message': '無法從 SurveyCake API 取得資料'
             }), 500
 
-        # 步驟 2: 解密資料
+        # 步驟 3: 解密資料
         logger.info("正在解密資料...")
-        decrypted_data = decrypt_surveycake_data(encrypted_data)
+        decrypted_data = decrypt_surveycake_data(encrypted_data, hash_key, iv_key)
         if decrypted_data is None:
             return jsonify({
                 'status': 'error',
@@ -267,7 +295,7 @@ def surveycake_webhook():
         logger.info(f"提交時間: {decrypted_data.get('submitTime', 'N/A')}")
         logger.info(f"回應數量: {len(decrypted_data.get('result', []))}")
 
-        # 步驟 3: 儲存到 Supabase
+        # 步驟 4: 儲存到 Supabase
         logger.info("正在儲存到 Supabase...")
         success = insert_to_supabase(decrypted_data, svid, hash_value)
 
